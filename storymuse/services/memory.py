@@ -11,17 +11,25 @@ The Algorithm:
    - Generate summary via LLM
    - Append to StoryBible.summary_buffer
    - Use only recent 3000 tokens in context
-3. Assemble prompt: Past (summary) + Context (characters) + Present (prose)
+3. Assemble prompt: Past (summary) + Lore + Context (characters) + Present (prose)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+from storymuse.services.lore_scanner import LoreScanner, ScanState, format_triggered_entries
+from storymuse.services.template_engine import (
+    TemplateEngine,
+    TemplateContext,
+    build_context_from_state,
+)
 
 if TYPE_CHECKING:
     from storymuse.core.client import LLMClient
     from storymuse.core.state import StoryBible
+    from storymuse.services.project_manager import ProjectManager
 
 
 class MemoryManager:
@@ -43,6 +51,8 @@ class MemoryManager:
     
     def __init__(self) -> None:
         self._last_summarized_pos: int = 0  # Track where we've summarized to
+        self._lore_state: ScanState = ScanState()  # Persistent state for lore scanning
+        self._template_engine: TemplateEngine = TemplateEngine()  # For Author's Note
     
     def estimate_tokens(self, text: str) -> int:
         """
@@ -120,6 +130,7 @@ class MemoryManager:
     def reset_for_chapter(self) -> None:
         """Reset summarization tracking for a new chapter."""
         self._last_summarized_pos = 0
+        # Note: We don't reset lore state - temporal dynamics persist across chapters
     
     def get_recent_content(self, chapter_content: str) -> str:
         """
@@ -147,12 +158,14 @@ class MemoryManager:
         self,
         bible: StoryBible,
         current_chapter: str,
+        pm: Optional[ProjectManager] = None,
     ) -> list[dict[str, str]]:
         """
         Build the full message list for the LLM.
         
         Structure:
         - System prompt with world settings
+        - Triggered World Info lore
         - Summary buffer (compressed past events)
         - Character context
         - Recent prose (last ~3000 tokens)
@@ -161,10 +174,16 @@ class MemoryManager:
         Args:
             bible: The StoryBible containing all story metadata
             current_chapter: The full text of the current chapter
+            pm: Optional ProjectManager for HSMW scene context
             
         Returns:
             List of message dicts ready for the LLM
         """
+        # Scan for triggered lore entries
+        scanner = LoreScanner(bible.world_info, self._lore_state)
+        triggered_lore = scanner.scan(current_chapter, advance_message=True)
+        lore_context = format_triggered_entries(triggered_lore)
+        
         # Build system prompt
         system_parts = [
             "You are a creative writing assistant helping to write a story.",
@@ -172,10 +191,21 @@ class MemoryManager:
             "",
             "## World Setting",
             bible.world.to_context_string(),
+        ]
+        
+        # Add triggered lore
+        if lore_context:
+            system_parts.extend([
+                "",
+                "## World Lore",
+                lore_context,
+            ])
+        
+        system_parts.extend([
             "",
             "## Characters",
             bible.characters_context(),
-        ]
+        ])
         
         # Add summary buffer if we have compressed history
         if bible.summary_buffer:
@@ -193,6 +223,18 @@ class MemoryManager:
             "- Show don't tell - use vivid descriptions and dialogue",
             "- Match the established tone and style",
         ])
+        
+        # Add Author's Note if configured (with template variable rendering)
+        if bible.author_note.strip():
+            # Build template context from current state
+            template_context = build_context_from_state(bible, pm)
+            rendered_note = self._template_engine.render(bible.author_note, template_context)
+            
+            system_parts.extend([
+                "",
+                "## Author's Note",
+                rendered_note,
+            ])
         
         system_prompt = "\n".join(system_parts)
         
@@ -217,6 +259,7 @@ class MemoryManager:
         bible: StoryBible,
         current_chapter: str,
         user_input: str,
+        pm: Optional[ProjectManager] = None,
     ) -> list[dict[str, str]]:
         """
         Build messages for continuing the story based on user input.
@@ -225,11 +268,12 @@ class MemoryManager:
             bible: The StoryBible containing all story metadata
             current_chapter: The full text of the current chapter
             user_input: What the user wants to happen next
+            pm: Optional ProjectManager for HSMW scene context
             
         Returns:
             List of message dicts ready for the LLM
         """
-        messages = self.assemble_context(bible, current_chapter)
+        messages = self.assemble_context(bible, current_chapter, pm)
         
         # Add user's direction
         messages.append({

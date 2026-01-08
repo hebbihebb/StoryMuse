@@ -4,6 +4,8 @@ Pydantic models for StoryMuse state management.
 This module implements the "Brain" of the hybrid persistence model:
 - Character profiles with stable UUID-based IDs
 - World settings for genre, tone, and rules
+- World Info database for dynamic lore injection
+- HSMW workflow integration (Plot → Outline → Write)
 - StoryBible as the root aggregate with atomic save/load
 """
 
@@ -17,6 +19,9 @@ from typing import Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
+
+from storymuse.core.worldinfo import WorldInfoDatabase, WorldInfoEntry
+from storymuse.core.outline import Outline, Plot
 
 
 class Character(BaseModel):
@@ -64,9 +69,18 @@ class StoryBible(BaseModel):
     
     characters: list[Character] = Field(default_factory=list)
     world: World = Field(default_factory=World)
+    world_info: WorldInfoDatabase = Field(default_factory=WorldInfoDatabase)
     summary_buffer: str = ""
     chapter_map: dict[str, str] = Field(default_factory=dict)  # {chapter_id: filename}
     active_chapter_id: Optional[str] = None
+    author_note: str = Field(
+        default="",
+        description="Dynamic Author's Note template with {{variables}}"
+    )
+    author_note_depth: int = Field(
+        default=4,
+        description="Inject Author's Note at this depth from end"
+    )
     
     def add_character(self, character: Character) -> None:
         """Add a new character to the story."""
@@ -121,6 +135,23 @@ class StoryBible(BaseModel):
         if not self.characters:
             return "No characters defined yet."
         return "\n\n".join(char.to_context_string() for char in self.characters)
+    
+    # World Info convenience methods
+    def add_lore(self, entry: WorldInfoEntry) -> str:
+        """Add a new lore entry and return its uid."""
+        return self.world_info.add_entry(entry)
+    
+    def get_lore(self, uid: str) -> Optional[WorldInfoEntry]:
+        """Get a lore entry by uid."""
+        return self.world_info.get_entry(uid)
+    
+    def delete_lore(self, uid: str) -> bool:
+        """Delete a lore entry by uid."""
+        return self.world_info.delete_entry(uid)
+    
+    def lore_groups(self) -> dict[str, int]:
+        """Get all lore groups and their entry counts."""
+        return self.world_info.get_groups()
     
     def save(self, path: Path) -> None:
         """
